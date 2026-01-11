@@ -37,13 +37,19 @@ echo ""
 echo -e "${BOLD}--- Syncing Repositories ---${NC}"
 echo ""
 
+# Normalize URL by removing .git suffix
+normalize_url() {
+    echo "${1%.git}"
+}
+
 # Helper function to find existing repo by URL
 find_repo_by_url() {
-    local search_url="$1"
+    local search_url
+    search_url=$(normalize_url "$1")
     for dir in "$PROJECTS_DIR"/*/; do
         if [ -d "$dir/.git" ]; then
             local remote_url
-            remote_url=$(git -C "$dir" remote get-url origin 2>/dev/null)
+            remote_url=$(normalize_url "$(git -C "$dir" remote get-url origin 2>/dev/null)")
             if [ "$remote_url" = "$search_url" ]; then
                 echo "$dir"
                 return 0
@@ -53,8 +59,14 @@ find_repo_by_url() {
     return 1
 }
 
-# Parse JSON and process each repo
-echo "$repos" | grep -o '"name":"[^"]*"' | sed 's/"name":"//;s/"$//' | while read -r name; do
+# Extract repo names into array (avoid subshell issues with while loop)
+repo_names=()
+while IFS= read -r name; do
+    repo_names+=("$name")
+done < <(echo "$repos" | grep -o '"name":"[^"]*"' | sed 's/"name":"//;s/"$//')
+
+# Process each repo
+for name in "${repo_names[@]}"; do
     url=$(echo "$repos" | grep -o "\"url\":\"[^\"]*/$name\"" | sed 's/"url":"//;s/"$//')
 
     # Check if repo already exists (by URL) in any folder
@@ -96,9 +108,12 @@ echo "$repos" | grep -o '"name":"[^"]*"' | sed 's/"name":"//;s/"$//' | while rea
         echo -e "  ${YELLOW}Stashed local changes${NC}"
     fi
 
-    # Pull latest
-    if ! git pull; then
-        echo -e "${RED}ERROR: Failed to pull $name${NC}"
+    # Pull latest (fast-forward only to avoid merge conflicts)
+    if ! git pull --ff-only 2>/dev/null; then
+        # Try regular pull if ff-only fails
+        if ! git pull --no-edit 2>/dev/null; then
+            echo -e "${RED}ERROR: Failed to pull $name (divergent branches)${NC}"
+        fi
     fi
 
     # Restore stashed changes if any
@@ -119,30 +134,29 @@ if [ "$CHECK_LOCAL_FOLDERS" = "true" ]; then
 
     found_issues=false
 
-    # Build list of remote URLs to detect duplicates
-    declare -A url_to_folders
+    # Build list of remote URLs to detect duplicates (using temp file to avoid subshell)
+    tmp_urls=$(mktemp)
     for dir in "$PROJECTS_DIR"/*/; do
         if [ -d "$dir/.git" ]; then
-            remote_url=$(git -C "$dir" remote get-url origin 2>/dev/null)
+            remote_url=$(normalize_url "$(git -C "$dir" remote get-url origin 2>/dev/null)")
             if [ -n "$remote_url" ]; then
                 dir_name=$(basename "$dir")
-                if [ -n "${url_to_folders[$remote_url]}" ]; then
-                    url_to_folders["$remote_url"]="${url_to_folders[$remote_url]}, $dir_name"
-                else
-                    url_to_folders["$remote_url"]="$dir_name"
-                fi
+                echo "$remote_url|$dir_name" >> "$tmp_urls"
             fi
         fi
     done
 
     # Check for duplicates
-    for url in "${!url_to_folders[@]}"; do
-        folders="${url_to_folders[$url]}"
-        if [[ "$folders" == *","* ]]; then
+    while IFS= read -r url; do
+        count=$(grep -c "^$url|" "$tmp_urls" 2>/dev/null || echo "0")
+        if [ "$count" -gt 1 ]; then
+            folders=$(grep "^$url|" "$tmp_urls" | cut -d'|' -f2 | tr '\n' ', ' | sed 's/, $//')
             echo -e "${YELLOW}WARNING:${NC} Duplicate repos found: $folders"
             found_issues=true
         fi
-    done
+    done < <(cut -d'|' -f1 "$tmp_urls" | sort -u)
+
+    rm -f "$tmp_urls"
 
     for dir in "$PROJECTS_DIR"/*/; do
         dir_name=$(basename "$dir")
